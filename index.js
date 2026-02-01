@@ -17,11 +17,11 @@ const { json } = require("express");
 const uri = process.env.MDB_URI;
 
 const client = new MongoClient(uri, {
-    serverApi: {
-        version: ServerApiVersion.v1,
-        strict: true,
-        deprecationErrors: true,
-    },
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
 });
 
 const port = process.env.PORT || 5000;
@@ -29,38 +29,91 @@ const port = process.env.PORT || 5000;
 const app = express();
 
 // Middleware
-app.use(cors({
-    origin: ['http://localhost:5173',],
-    credentials: true
-}));
+app.use(
+  cors({
+    origin: ["http://localhost:5173"],
+    credentials: true,
+  }),
+);
 app.use(cookieParser());
 app.use(express.json());
 
+// Simple Route
 app.get("/", (req, res) => {
-    res.send("Zap-Shift server is running...........");
+  res.send("Zap-Shift server is running...........");
 });
 
 const run = async () => {
-    try {
-        const zapShift = client.db("zapShift");
-        const parcelCollection = zapShift.collection("parcels");
+  try {
+    await client.connect();
+    console.log("MongoDB connected successfully");
 
+    const zapShift = client.db("zapShift");
+    const parcelCollection = zapShift.collection("parcels");
 
-        // Connect the client to the server (optional starting in v4.7)
-        // await client.connect();
-        // Send a ping to confirm a successful connection
-        // await client.db("admin").command({ ping: 1 });
-        // console.log("Pinged your deployment. You successfully connected to MongoDB!");
-    } finally {
-        // Ensures that the client will close when you finish/error
-        // await client.close();
-    }
+    // -----------------------------
+    // GET: All Parcels
+    // GET /parcels/user?email=optional → get parcels by user email or all parcels, sorted latest first
+    // -----------------------------
+    app.get("/parcels", async (req, res) => {
+      try {
+        const userEmail = req.query.email;
+
+        const parcelCollection = client.db("zapShift").collection("parcels");
+
+        // Build query
+        const query = userEmail ? { created_by: userEmail } : {};
+
+        const parcels = await parcelCollection
+          .find(query)
+          .sort({ createdAt: -1 }) // latest first
+          .toArray();
+
+        res.json(parcels);
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // -----------------------------
+    // GET: Single Parcel by ID
+    // -----------------------------
+    app.get("/parcels/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const parcel = await parcelCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        res.json(parcel);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // -----------------------------
+    // POST: Send Parcel Details
+    // -----------------------------
+    app.post("/parcels", async (req, res) => {
+      try {
+        const parcelData = req.body;
+        const result = await parcelCollection.insertOne(parcelData);
+        res.status(201).json({
+          message: "Parcel created successfully",
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+  } catch (error) {
+    console.error(error);
+  }
 };
 
 run().catch(console.dir);
 
 app.listen(port, () => {
-    console.log(`Zap-Shift server is running on port ${port}.`);
+  console.log(`Zap-Shift server is running on port ${port}.`);
 });
 
 // console.log("Mongo URI:", process.env.MDB_URI ? "Loaded ✅" : "Missing ❌");
