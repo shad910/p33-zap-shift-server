@@ -1,4 +1,12 @@
-require("dotenv").config();
+// 1. DNS CONFIGURATION FIRST - BEFORE ANYTHING ELSE
+process.env.NODE_OPTIONS = '--dns-result-order=ipv4first';
+const dns = require('node:dns');
+dns.setServers(['1.1.1.1','1.0.0.1', '8.8.8.8', '8.8.4.4']);
+
+// 2. NOW load environment variables (which contain MongoDB URI)
+require('dotenv').config();
+
+// 3. Then the rest of your imports
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
