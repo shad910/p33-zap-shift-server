@@ -1,10 +1,10 @@
 // 1. DNS CONFIGURATION FIRST - BEFORE ANYTHING ELSE
-process.env.NODE_OPTIONS = '--dns-result-order=ipv4first';
-const dns = require('node:dns');
-dns.setServers(['1.1.1.1','1.0.0.1', '8.8.8.8', '8.8.4.4']);
+process.env.NODE_OPTIONS = "--dns-result-order=ipv4first";
+const dns = require("node:dns");
+dns.setServers(["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]);
 
 // 2. NOW load environment variables (which contain MongoDB URI)
-require('dotenv').config();
+require("dotenv").config();
 
 // 3. Then the rest of your imports
 const express = require("express");
@@ -113,6 +113,42 @@ const run = async () => {
         res.status(500).json({ error: error.message });
       }
     });
+
+    // -----------------------------
+    // DELETE: Parcel by ID
+    // -----------------------------
+    app.delete("/parcels/:id", async (req, res) => {
+      try {
+        const id = new ObjectId(req.params.id);
+
+        // Find the parcel
+        const parcel = await parcelCollection.findOne({ _id: id });
+        if (!parcel)
+          return res.status(404).json({ message: "Parcel not found" });
+
+        // Prevent deletion if paid
+        if (parcel.paymentStatus === "Paid")
+          return res
+            .status(403)
+            .json({ message: "Paid parcels cannot be deleted" });
+
+        // Delete parcel
+        const { deletedCount } = await parcelCollection.deleteOne({ _id: id });
+        if (deletedCount > 0) {
+          return res.json({
+            message: "Parcel deleted successfully",
+            deletedCount,
+          });
+        }
+
+        res
+          .status(404)
+          .json({ message: "Parcel not found or already deleted" });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+    
   } catch (error) {
     console.error(error);
   }
