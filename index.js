@@ -12,6 +12,7 @@ const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const admin = require("firebase-admin");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const stripe = require("stripe")(process.env.Payment_Secret_Key);
 const { json } = require("express");
 
 //fixed firebase admin initialization issue
@@ -58,6 +59,7 @@ const run = async () => {
 
     const zapShift = client.db("zapShift");
     const parcelCollection = zapShift.collection("parcels");
+    const paymentsCollection = zapShift.collection("payments");
 
     // -----------------------------
     // GET: All Parcels
@@ -74,7 +76,7 @@ const run = async () => {
 
         const parcels = await parcelCollection
           .find(query)
-          .sort({ createdAt: -1 }) // latest first
+          .sort({ creation_date: -1 }) // latest first
           .toArray();
 
         res.json(parcels);
@@ -148,7 +150,93 @@ const run = async () => {
         res.status(500).json({ error: error.message });
       }
     });
-    
+
+    // Payment Integration with Stripe
+    app.post("/create-payment-intent", async (req, res) => {
+      const amount = req.body.amount;
+
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+
+        res.json({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // GET: Payment history (latest first, supports user filtering)
+    app.get("/payments", async (req, res) => {
+      try {
+        const paymentsCollection = client.db("zapShift").collection("payments");
+
+        const userEmail = req.query.email; // optional: ?email=user@example.com
+
+        // Build query: if email is provided, filter by paidBy
+        const query = userEmail ? { paidBy: userEmail } : {};
+
+        const payments = await paymentsCollection
+          .find(query)
+          .sort({ paymentDate: -1 }) // latest first
+          .toArray();
+
+        res.json(payments);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // POST: Mark parcel as Paid
+    app.post("/payments", async (req, res) => {
+      try {
+        const { parcelId, email, amount, paymentMethod, transactionId } =
+          req.body;
+
+        if (!parcelId)
+          return res.status(400).json({ message: "parcelId is required" });
+
+        const id = new ObjectId(parcelId);
+
+        // Find the parcel
+        const parcel = await parcelCollection.findOne({ _id: id });
+        if (!parcel)
+          return res.status(404).json({ message: "Parcel not found" });
+
+        if (parcel.paymentStatus === "paid")
+          return res.status(400).json({ message: "Parcel already paid" });
+
+        // Update parcel payment status
+        await parcelCollection.updateOne(
+          { _id: id },
+          { $set: { paymentStatus: "paid" } },
+        );
+
+        // Log payment history
+        const paymentsCollection = client.db("zapShift").collection("payments");
+        const result = await paymentsCollection.insertOne({
+          parcelId: parcel._id, // Mongo _id of the parcel
+          parcelTitle: parcel.parcelTitle,
+          senderName: parcel.senderName,
+          receiverName: parcel.receiverName,
+          amount: amount || parcel.deliveryCost, // use amount from request if provided
+          paidBy: email || parcel.created_by, // use email from request if provided
+          paymentDate: new Date().toISOString(),
+          paymentMethod: paymentMethod || "Card / Stripe", // fallback default
+          transactionId: transactionId || null, // optional transaction reference
+        });
+
+        // Return message + insertedId for client-side alert
+        res.json({
+          message: "Payment marked as Paid successfully",
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
   } catch (error) {
     console.error(error);
   }
