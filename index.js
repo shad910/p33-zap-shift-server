@@ -10,18 +10,15 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-const admin = require("firebase-admin");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.Payment_Secret_Key);
 const { json } = require("express");
+const admin = require("firebase-admin");
+const serviceAccount = require("./firebase-admin-service-key.json");
 
-//fixed firebase admin initialization issue
-// const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
-// const serviceAccount = JSON.parse(decoded);
-
-// admin.initializeApp({
-//     credential: admin.credential.cert(serviceAccount)
-// });
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 
 const uri = process.env.MDB_URI;
 
@@ -52,22 +49,104 @@ app.get("/", (req, res) => {
   res.send("Zap-Shift server is running...........");
 });
 
+const verifyFbToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({
+      message: "Unauthorized access: Missing or invalid authorization header",
+    });
+  }
+
+  const token = authHeader.split(" ")[1];
+  if (!token) {
+    return res
+      .status(401)
+      .json({ message: "Unauthorized access: Invalid token format" });
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.decoded = decoded;
+    next();
+  } catch (error) {
+    return res
+      .status(403)
+      .json({ message: "Forbidden access: Invalid or expired token" });
+  }
+
+  console.log(req.decoded);
+};
+
 const run = async () => {
   try {
     await client.connect();
     console.log("MongoDB connected successfully");
 
     const zapShift = client.db("zapShift");
+    const usersCollection = zapShift.collection("users");
     const parcelCollection = zapShift.collection("parcels");
     const paymentsCollection = zapShift.collection("payments");
 
     // -----------------------------
+    // USER MANAGEMENT ENDPOINTS
+    // -----------------------------
+
+    app.get("/users", async (req, res) => {
+      const users = await usersCollection.find().toArray();
+      res.json(users);
+    });
+
+    app.post("/users", async (req, res) => {
+      const { email, last_login } = req.body;
+
+      const emailExists = await usersCollection.findOne({ email });
+
+      if (emailExists) {
+        // Update last_login if user already exists
+        const updateResult = await usersCollection.updateOne(
+          { email },
+          {
+            $set: {
+              last_login: last_login || new Date().toISOString(),
+            },
+          },
+        );
+
+        return res.status(200).json({
+          message: "Last login updated successfully",
+        });
+      }
+
+      // Create new user if not exists
+      const user = {
+        ...req.body,
+        created_at: new Date().toISOString(),
+        last_login: last_login || new Date().toISOString(),
+      };
+
+      const result = await usersCollection.insertOne(user);
+
+      res.status(201).json({
+        message: "User created successfully",
+        insertedId: result.insertedId,
+      });
+    });
+
+    // -----------------------------
+    // PARCEL MANAGEMENT ENDPOINTS
+    // -----------------------------
+
     // GET: All Parcels
     // GET /parcels/user?email=optional → get parcels by user email or all parcels, sorted latest first
-    // -----------------------------
-    app.get("/parcels", async (req, res) => {
+    app.get("/parcels", verifyFbToken, async (req, res) => {
       try {
         const userEmail = req.query.email;
+
+        if (userEmail && req.decoded.email !== userEmail) {
+          return res
+            .status(403)
+            .json({ message: "Forbidden: You can only access your own parcels" });
+        };
 
         const parcelCollection = client.db("zapShift").collection("parcels");
 
@@ -85,10 +164,8 @@ const run = async () => {
       }
     });
 
-    // -----------------------------
     // GET: Single Parcel by ID
-    // -----------------------------
-    app.get("/parcels/:id", async (req, res) => {
+    app.get("/parcels/:id", verifyFbToken, async (req, res) => {
       try {
         const id = req.params.id;
         const parcel = await parcelCollection.findOne({
@@ -100,9 +177,7 @@ const run = async () => {
       }
     });
 
-    // -----------------------------
     // POST: Send Parcel Details
-    // -----------------------------
     app.post("/parcels", async (req, res) => {
       try {
         const parcelData = req.body;
@@ -116,9 +191,7 @@ const run = async () => {
       }
     });
 
-    // -----------------------------
     // DELETE: Parcel by ID
-    // -----------------------------
     app.delete("/parcels/:id", async (req, res) => {
       try {
         const id = new ObjectId(req.params.id);
@@ -151,6 +224,35 @@ const run = async () => {
       }
     });
 
+    // -----------------------------
+    // PAYMENT MANAGEMENT ENDPOINTS
+    // -----------------------------
+
+    // GET: Payment history (latest first, supports user filtering)
+    app.get("/payments", verifyFbToken, async (req, res) => {
+      try {
+        const userEmail = req.query.email; // optional: ?email=user@example.com
+
+        if (userEmail && req.decoded.email !== userEmail) {
+          return res
+            .status(403)
+            .json({ message: "Forbidden: You can only access your own payments" });
+        }
+
+        // Build query: if email is provided, filter by paidBy
+        const query = userEmail ? { paidBy: userEmail } : {};
+
+        const payments = await paymentsCollection
+          .find(query)
+          .sort({ paymentDate: -1 }) // latest first
+          .toArray();
+
+        res.json(payments);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
     // Payment Integration with Stripe
     app.post("/create-payment-intent", async (req, res) => {
       const amount = req.body.amount;
@@ -168,45 +270,35 @@ const run = async () => {
       }
     });
 
-    // GET: Payment history (latest first, supports user filtering)
-    app.get("/payments", async (req, res) => {
-      try {
-        const paymentsCollection = client.db("zapShift").collection("payments");
-
-        const userEmail = req.query.email; // optional: ?email=user@example.com
-
-        // Build query: if email is provided, filter by paidBy
-        const query = userEmail ? { paidBy: userEmail } : {};
-
-        const payments = await paymentsCollection
-          .find(query)
-          .sort({ paymentDate: -1 }) // latest first
-          .toArray();
-
-        res.json(payments);
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
-
     // POST: Mark parcel as Paid
     app.post("/payments", async (req, res) => {
       try {
-        const { parcelId, email, amount, paymentMethod, transactionId } =
-          req.body;
+        const {
+          mainParcelID,
+          parcelId,
+          email,
+          amount,
+          paymentMethod,
+          transactionId,
+        } = req.body;
 
-        if (!parcelId)
-          return res.status(400).json({ message: "parcelId is required" });
+        if (!mainParcelID || !parcelId) {
+          return res
+            .status(400)
+            .json({ message: "Both mainParcelID and parcelId are required" });
+        }
 
-        const id = new ObjectId(parcelId);
+        const id = new ObjectId(mainParcelID);
 
         // Find the parcel
         const parcel = await parcelCollection.findOne({ _id: id });
-        if (!parcel)
+        if (!parcel) {
           return res.status(404).json({ message: "Parcel not found" });
+        }
 
-        if (parcel.paymentStatus === "paid")
+        if (parcel.paymentStatus === "paid") {
           return res.status(400).json({ message: "Parcel already paid" });
+        }
 
         // Update parcel payment status
         await parcelCollection.updateOne(
@@ -215,25 +307,25 @@ const run = async () => {
         );
 
         // Log payment history
-        const paymentsCollection = client.db("zapShift").collection("payments");
         const result = await paymentsCollection.insertOne({
-          parcelId: parcel._id, // Mongo _id of the parcel
+          mainParcelID: parcel._id, // Mongo _id
+          parcelId: parcelId, // Your generated parcelId
           parcelTitle: parcel.parcelTitle,
           senderName: parcel.senderName,
           receiverName: parcel.receiverName,
-          amount: amount || parcel.deliveryCost, // use amount from request if provided
-          paidBy: email || parcel.created_by, // use email from request if provided
+          amount: amount || parcel.deliveryCost,
+          paidBy: email || parcel.created_by,
           paymentDate: new Date().toISOString(),
-          paymentMethod: paymentMethod || "Card / Stripe", // fallback default
-          transactionId: transactionId || null, // optional transaction reference
+          paymentMethod: paymentMethod || "Card / Stripe",
+          transactionId: transactionId || null,
         });
 
-        // Return message + insertedId for client-side alert
         res.json({
           message: "Payment marked as Paid successfully",
           insertedId: result.insertedId,
         });
       } catch (error) {
+        console.error("Payment API error:", error);
         res.status(500).json({ error: error.message });
       }
     });
@@ -247,6 +339,3 @@ run().catch(console.dir);
 app.listen(port, () => {
   console.log(`Zap-Shift server is running on port ${port}.`);
 });
-
-// console.log("Mongo URI:", process.env.MDB_URI ? "Loaded ✅" : "Missing ❌");
-// console.log("Firebase Key:", process.env.FB_SERVICE_KEY ? "Loaded ✅" : "Missing ❌");
