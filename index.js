@@ -84,6 +84,7 @@ const run = async () => {
 
     const zapShift = client.db("zapShift");
     const usersCollection = zapShift.collection("users");
+    const ridersCollection = zapShift.collection("riders");
     const parcelCollection = zapShift.collection("parcels");
     const paymentsCollection = zapShift.collection("payments");
 
@@ -97,40 +98,203 @@ const run = async () => {
     });
 
     app.post("/users", async (req, res) => {
-      const { email, last_login } = req.body;
+      try {
+        const { email, last_login } = req.body;
 
-      const emailExists = await usersCollection.findOne({ email });
+        // Validate email
+        if (!email) {
+          return res.status(400).json({
+            message: "Email is required",
+          });
+        }
 
-      if (emailExists) {
-        // Update last_login if user already exists
-        const updateResult = await usersCollection.updateOne(
-          { email },
-          {
-            $set: {
-              last_login: last_login || new Date().toISOString(),
+        const emailExists = await usersCollection.findOne({ email });
+
+        if (emailExists) {
+          // Update last_login if user already exists
+          await usersCollection.updateOne(
+            { email },
+            {
+              $set: {
+                last_login: last_login || new Date().toISOString(),
+              },
             },
-          },
-        );
+          );
 
-        return res.status(200).json({
-          message: "Last login updated successfully",
+          return res.status(200).json({
+            message: "Last login updated successfully",
+            updated: true,
+            userId: emailExists._id,
+          });
+        }
+
+        // Create new user if not exists
+        const user = {
+          ...req.body,
+          created_at: new Date().toISOString(),
+          last_login: last_login || new Date().toISOString(),
+        };
+
+        const result = await usersCollection.insertOne(user);
+
+        res.status(201).json({
+          message: "User created successfully",
+          insertedId: result.insertedId,
+          created: true,
+        });
+      } catch (error) {
+        console.error("User API Error:", error);
+        res.status(500).json({
+          message: "Internal Server Error",
         });
       }
-
-      // Create new user if not exists
-      const user = {
-        ...req.body,
-        created_at: new Date().toISOString(),
-        last_login: last_login || new Date().toISOString(),
-      };
-
-      const result = await usersCollection.insertOne(user);
-
-      res.status(201).json({
-        message: "User created successfully",
-        insertedId: result.insertedId,
-      });
     });
+
+
+    // -----------------------------
+    // RIDER MANAGEMENT ENDPOINTS
+    // -----------------------------
+
+    app.get("/riders/active", async (req, res) => {
+      try {
+        const activeRiders = await ridersCollection
+          .find({ status: "active" })
+          .toArray();
+
+        res.status(200).json(activeRiders);
+      } catch (error) {
+        console.error("Pending Riders API Error:", error);
+        res.status(500).json({
+          message: "Internal Server Error",
+        });
+      }
+    });
+    
+    app.get("/riders/de-active", async (req, res) => {
+      try {
+        const deActiveRiders = await ridersCollection
+          .find({ status: "deactive" })
+          .toArray();
+
+        res.status(200).json(deActiveRiders);
+      } catch (error) {
+        console.error("Pending Riders API Error:", error);
+        res.status(500).json({
+          message: "Internal Server Error",
+        });
+      }
+    });
+
+    app.get("/riders/pending", async (req, res) => {
+      try {
+        const pendingRiders = await ridersCollection
+          .find({ status: "pending" })
+          .toArray();
+
+        res.status(200).json(pendingRiders);
+      } catch (error) {
+        console.error("Pending Riders API Error:", error);
+        res.status(500).json({
+          message: "Internal Server Error",
+        });
+      }
+    });
+
+    app.post("/riders", async (req, res) => {
+      try {
+        const rider = req.body;
+        const { name, email } = rider;
+
+        // Validate required fields
+        if (!name || !email) {
+          return res.status(400).json({
+            message: "Name and Email are required",
+          });
+        }
+
+        // Check if already applied
+        const existingRider = await ridersCollection.findOne({ email });
+
+        if (existingRider) {
+          return res.status(409).json({
+            message: "You have already applied as a rider",
+            exists: true,
+          });
+        }
+
+        // Prepare rider data (backend controlled fields)
+        const riderData = {
+          ...rider,
+          status: "pending", // default status
+          created_at: new Date().toISOString(),
+          updated_at: null,
+        };
+
+        const result = await ridersCollection.insertOne(riderData);
+
+        res.status(201).json({
+          message: "Application submitted successfully",
+          insertedId: result.insertedId,
+          created: true,
+        });
+      } catch (error) {
+        console.error("Riders API Error:", error);
+
+        res.status(500).json({
+          message: "Internal Server Error",
+        });
+      }
+    });
+
+    // PATCH rider status
+    app.patch("/riders/:id/approve", async (req, res) => {
+      const { id } = req.params;
+      const result = await ridersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "active", updated_at: new Date().toISOString() } },
+      );
+      res.json({ modifiedCount: result.modifiedCount });
+    });
+
+    app.patch("/riders/:id/status", async (req, res) => {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      if (!status || !["active", "deactive"].includes(status)) {
+        return res.status(400).json({ message: "Invalid status value" });
+      }
+
+      try {
+        const result = await ridersCollection.updateOne(
+          { _id: new ObjectId(id) }, // ✅ convert string id to ObjectId
+          { $set: { status, updated_at: new Date().toISOString() } },
+        );
+
+        if (result.modifiedCount === 0) {
+          return res
+            .status(404)
+            .json({ message: "Rider not found or status unchanged" });
+        }
+
+        res.json({
+          message: "Status updated successfully",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Failed to update status", error });
+      }
+    });
+
+    // DELETE rider
+    app.delete("/riders/:id", async (req, res) => {
+      const { id } = req.params;
+      const result = await ridersCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+      res.json({ deletedCount: result.deletedCount });
+    });
+
 
     // -----------------------------
     // PARCEL MANAGEMENT ENDPOINTS
@@ -143,10 +307,10 @@ const run = async () => {
         const userEmail = req.query.email;
 
         if (userEmail && req.decoded.email !== userEmail) {
-          return res
-            .status(403)
-            .json({ message: "Forbidden: You can only access your own parcels" });
-        };
+          return res.status(403).json({
+            message: "Forbidden: You can only access your own parcels",
+          });
+        }
 
         const parcelCollection = client.db("zapShift").collection("parcels");
 
@@ -224,6 +388,7 @@ const run = async () => {
       }
     });
 
+    
     // -----------------------------
     // PAYMENT MANAGEMENT ENDPOINTS
     // -----------------------------
@@ -234,9 +399,9 @@ const run = async () => {
         const userEmail = req.query.email; // optional: ?email=user@example.com
 
         if (userEmail && req.decoded.email !== userEmail) {
-          return res
-            .status(403)
-            .json({ message: "Forbidden: You can only access your own payments" });
+          return res.status(403).json({
+            message: "Forbidden: You can only access your own payments",
+          });
         }
 
         // Build query: if email is provided, filter by paidBy
