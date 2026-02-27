@@ -92,9 +92,71 @@ const run = async () => {
     // USER MANAGEMENT ENDPOINTS
     // -----------------------------
 
-    app.get("/users", async (req, res) => {
-      const users = await usersCollection.find().toArray();
-      res.json(users);
+    app.get("/users", verifyFbToken, async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find()
+          .project({ name: 1, email: 1, role: 1, created_at: 1, last_login: 1 }) // return only needed fields
+          .toArray();
+
+        res.json(users);
+      } catch (error) {
+        console.error("Get all users error:", error);
+        res.status(500).json({ message: "Failed to fetch users" });
+      }
+    });
+
+    app.get("/users/role/:email", verifyFbToken, async (req, res) => {
+  const { email } = req.params;
+
+  try {
+    const user = await usersCollection.findOne(
+      { email },
+      { projection: { role: 1, _id: 0 } } // only return role
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json({ email, role: user.role });
+  } catch (error) {
+    console.error("Get user role error:", error);
+    res.status(500).json({ message: "Failed to fetch user role" });
+  }
+});
+
+    // SEARCH users by name or email (max 5 if query is provided)
+    app.get("/users/search", verifyFbToken, async (req, res) => {
+      const { query } = req.query;
+
+      try {
+        let filter = {};
+        if (query) {
+          filter = {
+            $or: [
+              { name: { $regex: query, $options: "i" } },
+              { email: { $regex: query, $options: "i" } },
+            ],
+          };
+        }
+
+        const usersCursor = usersCollection
+          .find(filter)
+          .sort({ created_at: -1 });
+
+        if (query) {
+          usersCursor.limit(5); // max 5 for search
+        }
+
+        const users = await usersCursor.toArray();
+        res.json(users);
+      } catch (error) {
+        console.error("Search users error:", error);
+        res.status(500).json({
+          message: "Failed to search users",
+        });
+      }
     });
 
     app.post("/users", async (req, res) => {
@@ -150,12 +212,66 @@ const run = async () => {
       }
     });
 
+    // UPDATE user role (admin or restore previous role)
+    app.patch("/users/:id/role", async (req, res) => {
+      const { id } = req.params;
+      const { makeAdmin } = req.body;
+
+      try {
+        const user = await usersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            message: "User not found",
+          });
+        }
+
+        let updateDoc = {};
+
+        if (makeAdmin) {
+          updateDoc = {
+            $set: {
+              role: "admin",
+              previousRole: user.role || "user",
+              updated_at: new Date().toISOString(),
+            },
+          };
+        } else {
+          updateDoc = {
+            $set: {
+              role: user.previousRole || "user",
+              updated_at: new Date().toISOString(),
+            },
+            $unset: {
+              previousRole: "",
+            },
+          };
+        }
+
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          updateDoc,
+        );
+
+        res.json({
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Update role error:", error);
+
+        res.status(500).json({
+          message: "Failed to update role",
+        });
+      }
+    });
 
     // -----------------------------
     // RIDER MANAGEMENT ENDPOINTS
     // -----------------------------
 
-    app.get("/riders/active", async (req, res) => {
+    app.get("/riders/active", verifyFbToken, async (req, res) => {
       try {
         const activeRiders = await ridersCollection
           .find({ status: "active" })
@@ -169,8 +285,8 @@ const run = async () => {
         });
       }
     });
-    
-    app.get("/riders/de-active", async (req, res) => {
+
+    app.get("/riders/de-active", verifyFbToken, async (req, res) => {
       try {
         const deActiveRiders = await ridersCollection
           .find({ status: "deactive" })
@@ -185,7 +301,7 @@ const run = async () => {
       }
     });
 
-    app.get("/riders/pending", async (req, res) => {
+    app.get("/riders/pending", verifyFbToken, async (req, res) => {
       try {
         const pendingRiders = await ridersCollection
           .find({ status: "pending" })
@@ -246,56 +362,104 @@ const run = async () => {
       }
     });
 
-    // PATCH rider status
-    app.patch("/riders/:id/approve", async (req, res) => {
-      const { id } = req.params;
-      const result = await ridersCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status: "active", updated_at: new Date().toISOString() } },
-      );
-      res.json({ modifiedCount: result.modifiedCount });
-    });
-
+    // PATCH rider status and update user role accordingly
     app.patch("/riders/:id/status", async (req, res) => {
       const { id } = req.params;
       const { status } = req.body;
 
-      if (!status || !["active", "deactive"].includes(status)) {
-        return res.status(400).json({ message: "Invalid status value" });
-      }
-
       try {
-        const result = await ridersCollection.updateOne(
-          { _id: new ObjectId(id) }, // ✅ convert string id to ObjectId
-          { $set: { status, updated_at: new Date().toISOString() } },
-        );
+        // determine user role based on rider status
+        const newRole = status === "active" ? "rider" : "user";
 
-        if (result.modifiedCount === 0) {
-          return res
-            .status(404)
-            .json({ message: "Rider not found or status unchanged" });
+        // first get rider info to retrieve email
+        const rider = await ridersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!rider) {
+          return res.status(404).json({
+            message: "Rider not found",
+          });
         }
 
+        // update rider status
+        const riderResult = await ridersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status,
+              updated_at: new Date().toISOString(),
+            },
+          },
+        );
+
+        // update user role using email
+        const userResult = await usersCollection.updateOne(
+          { email: rider.email },
+          {
+            $set: {
+              role: newRole,
+              updated_at: new Date().toISOString(),
+            },
+          },
+        );
+
         res.json({
-          message: "Status updated successfully",
-          modifiedCount: result.modifiedCount,
+          modifiedCount: riderResult.modifiedCount,
+          userRoleUpdated: userResult.modifiedCount,
+          role: newRole,
         });
       } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Failed to update status", error });
+        console.error("Status update error:", error);
+        res.status(500).json({
+          message: "Failed to update rider status and user role",
+        });
       }
     });
 
-    // DELETE rider
+    // DELETE rider and update user role to "user"
     app.delete("/riders/:id", async (req, res) => {
       const { id } = req.params;
-      const result = await ridersCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-      res.json({ deletedCount: result.deletedCount });
+
+      try {
+        // find rider first to get email
+        const rider = await ridersCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!rider) {
+          return res.status(404).json({
+            message: "Rider not found",
+          });
+        }
+
+        // update user role to "user"
+        const userResult = await usersCollection.updateOne(
+          { email: rider.email },
+          {
+            $set: {
+              role: "user",
+              updated_at: new Date().toISOString(),
+            },
+          },
+        );
+
+        // delete rider
+        const riderResult = await ridersCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.json({
+          deletedCount: riderResult.deletedCount,
+          userRoleUpdated: userResult.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Delete rider error:", error);
+        res.status(500).json({
+          message: "Failed to delete rider and update user role",
+        });
+      }
     });
-
-
     // -----------------------------
     // PARCEL MANAGEMENT ENDPOINTS
     // -----------------------------
@@ -388,7 +552,6 @@ const run = async () => {
       }
     });
 
-    
     // -----------------------------
     // PAYMENT MANAGEMENT ENDPOINTS
     // -----------------------------
