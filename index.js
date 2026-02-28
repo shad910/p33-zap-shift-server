@@ -15,6 +15,7 @@ const stripe = require("stripe")(process.env.Payment_Secret_Key);
 const { json } = require("express");
 const admin = require("firebase-admin");
 const serviceAccount = require("./firebase-admin-service-key.json");
+const middlewareWrapper = require("cors");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -49,34 +50,6 @@ app.get("/", (req, res) => {
   res.send("Zap-Shift server is running...........");
 });
 
-const verifyFbToken = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({
-      message: "Unauthorized access: Missing or invalid authorization header",
-    });
-  }
-
-  const token = authHeader.split(" ")[1];
-  if (!token) {
-    return res
-      .status(401)
-      .json({ message: "Unauthorized access: Invalid token format" });
-  }
-
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.decoded = decoded;
-    next();
-  } catch (error) {
-    return res
-      .status(403)
-      .json({ message: "Forbidden access: Invalid or expired token" });
-  }
-
-  console.log(req.decoded);
-};
-
 const run = async () => {
   try {
     await client.connect();
@@ -88,11 +61,60 @@ const run = async () => {
     const parcelCollection = zapShift.collection("parcels");
     const paymentsCollection = zapShift.collection("payments");
 
+    // Middleware
+    const verifyFbToken = async (req, res, next) => {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({
+          message:
+            "Unauthorized access: Missing or invalid authorization header",
+        });
+      }
+
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res
+          .status(401)
+          .json({ message: "Unauthorized access: Invalid token format" });
+      }
+
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.decoded = decoded;
+        next();
+      } catch (error) {
+        return res
+          .status(403)
+          .json({ message: "Forbidden access: Invalid or expired token" });
+      }
+    };
+
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        if (!req.decoded?.email) {
+          return res.status(401).json({ message: "Unauthorized access" });
+        }
+
+        const user = await usersCollection.findOne({
+          email: req.decoded.email,
+        });
+
+        if (!user || user.role !== "admin") {
+          return res.status(403).json({ message: "Forbidden access" });
+        }
+
+        next();
+      } catch (error) {
+        console.error("Admin verification error:", error);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    };
+
     // -----------------------------
     // USER MANAGEMENT ENDPOINTS
     // -----------------------------
 
-    app.get("/users", verifyFbToken, async (req, res) => {
+    app.get("/users", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         const users = await usersCollection
           .find()
@@ -106,28 +128,33 @@ const run = async () => {
       }
     });
 
-    app.get("/users/role/:email", verifyFbToken, async (req, res) => {
-  const { email } = req.params;
+    app.get(
+      "/users/role/:email",
+      verifyFbToken,
 
-  try {
-    const user = await usersCollection.findOne(
-      { email },
-      { projection: { role: 1, _id: 0 } } // only return role
+      async (req, res) => {
+        const { email } = req.params;
+
+        try {
+          const user = await usersCollection.findOne(
+            { email },
+            { projection: { role: 1, _id: 0 } }, // only return role
+          );
+
+          if (!user) {
+            return res.status(404).json({ message: "User not found" });
+          }
+
+          res.json({ email, role: user.role });
+        } catch (error) {
+          console.error("Get user role error:", error);
+          res.status(500).json({ message: "Failed to fetch user role" });
+        }
+      },
     );
 
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    res.json({ email, role: user.role });
-  } catch (error) {
-    console.error("Get user role error:", error);
-    res.status(500).json({ message: "Failed to fetch user role" });
-  }
-});
-
     // SEARCH users by name or email (max 5 if query is provided)
-    app.get("/users/search", verifyFbToken, async (req, res) => {
+    app.get("/users/search", verifyFbToken, verifyAdmin, async (req, res) => {
       const { query } = req.query;
 
       try {
@@ -213,65 +240,70 @@ const run = async () => {
     });
 
     // UPDATE user role (admin or restore previous role)
-    app.patch("/users/:id/role", async (req, res) => {
-      const { id } = req.params;
-      const { makeAdmin } = req.body;
+    app.patch(
+      "/users/:id/role",
+      verifyFbToken,
 
-      try {
-        const user = await usersCollection.findOne({
-          _id: new ObjectId(id),
-        });
+      async (req, res) => {
+        const { id } = req.params;
+        const { makeAdmin } = req.body;
 
-        if (!user) {
-          return res.status(404).json({
-            message: "User not found",
+        try {
+          const user = await usersCollection.findOne({
+            _id: new ObjectId(id),
+          });
+
+          if (!user) {
+            return res.status(404).json({
+              message: "User not found",
+            });
+          }
+
+          let updateDoc = {};
+
+          if (makeAdmin) {
+            updateDoc = {
+              $set: {
+                role: "admin",
+                previousRole: user.role || "user",
+                updated_at: new Date().toISOString(),
+              },
+            };
+          } else {
+            updateDoc = {
+              $set: {
+                role: user.previousRole || "user",
+                updated_at: new Date().toISOString(),
+              },
+              $unset: {
+                previousRole: "",
+              },
+            };
+          }
+
+          const result = await usersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            updateDoc,
+          );
+
+          res.json({
+            modifiedCount: result.modifiedCount,
+          });
+        } catch (error) {
+          console.error("Update role error:", error);
+
+          res.status(500).json({
+            message: "Failed to update role",
           });
         }
-
-        let updateDoc = {};
-
-        if (makeAdmin) {
-          updateDoc = {
-            $set: {
-              role: "admin",
-              previousRole: user.role || "user",
-              updated_at: new Date().toISOString(),
-            },
-          };
-        } else {
-          updateDoc = {
-            $set: {
-              role: user.previousRole || "user",
-              updated_at: new Date().toISOString(),
-            },
-            $unset: {
-              previousRole: "",
-            },
-          };
-        }
-
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          updateDoc,
-        );
-
-        res.json({
-          modifiedCount: result.modifiedCount,
-        });
-      } catch (error) {
-        console.error("Update role error:", error);
-
-        res.status(500).json({
-          message: "Failed to update role",
-        });
-      }
-    });
+      },
+    );
 
     // -----------------------------
     // RIDER MANAGEMENT ENDPOINTS
     // -----------------------------
 
-    app.get("/riders/active", verifyFbToken, async (req, res) => {
+    app.get("/riders/active", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         const activeRiders = await ridersCollection
           .find({ status: "active" })
@@ -286,22 +318,27 @@ const run = async () => {
       }
     });
 
-    app.get("/riders/de-active", verifyFbToken, async (req, res) => {
-      try {
-        const deActiveRiders = await ridersCollection
-          .find({ status: "deactive" })
-          .toArray();
+    app.get(
+      "/riders/de-active",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const deActiveRiders = await ridersCollection
+            .find({ status: "deactive" })
+            .toArray();
 
-        res.status(200).json(deActiveRiders);
-      } catch (error) {
-        console.error("Pending Riders API Error:", error);
-        res.status(500).json({
-          message: "Internal Server Error",
-        });
-      }
-    });
+          res.status(200).json(deActiveRiders);
+        } catch (error) {
+          console.error("Pending Riders API Error:", error);
+          res.status(500).json({
+            message: "Internal Server Error",
+          });
+        }
+      },
+    );
 
-    app.get("/riders/pending", verifyFbToken, async (req, res) => {
+    app.get("/riders/pending", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         const pendingRiders = await ridersCollection
           .find({ status: "pending" })
@@ -314,6 +351,20 @@ const run = async () => {
           message: "Internal Server Error",
         });
       }
+    });
+
+    app.get("/riders/available", async (req, res) => {
+      const { district, region } = req.query;
+
+      const query = {
+        status: "active",
+        district: district,
+        region: region,
+      };
+
+      const riders = await ridersCollection.find(query).toArray();
+
+      res.send(riders);
     });
 
     app.post("/riders", async (req, res) => {
@@ -368,10 +419,6 @@ const run = async () => {
       const { status } = req.body;
 
       try {
-        // determine user role based on rider status
-        const newRole = status === "active" ? "rider" : "user";
-
-        // first get rider info to retrieve email
         const rider = await ridersCollection.findOne({
           _id: new ObjectId(id),
         });
@@ -380,6 +427,37 @@ const run = async () => {
           return res.status(404).json({
             message: "Rider not found",
           });
+        }
+
+        const user = await usersCollection.findOne({
+          email: rider.email,
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            message: "Associated user not found",
+          });
+        }
+
+        let roleToSet;
+
+        if (status === "active") {
+          // store previous role if not already stored
+          if (!rider.previousRole) {
+            await ridersCollection.updateOne(
+              { _id: new ObjectId(id) },
+              {
+                $set: {
+                  previousRole: user.role,
+                },
+              },
+            );
+          }
+
+          roleToSet = "rider";
+        } else {
+          // restore previous role if exists
+          roleToSet = rider.previousRole || "user";
         }
 
         // update rider status
@@ -393,12 +471,12 @@ const run = async () => {
           },
         );
 
-        // update user role using email
+        // update user role
         const userResult = await usersCollection.updateOne(
           { email: rider.email },
           {
             $set: {
-              role: newRole,
+              role: roleToSet,
               updated_at: new Date().toISOString(),
             },
           },
@@ -407,7 +485,7 @@ const run = async () => {
         res.json({
           modifiedCount: riderResult.modifiedCount,
           userRoleUpdated: userResult.modifiedCount,
-          role: newRole,
+          role: roleToSet,
         });
       } catch (error) {
         console.error("Status update error:", error);
@@ -417,12 +495,56 @@ const run = async () => {
       }
     });
 
-    // DELETE rider and update user role to "user"
+    // Assign rider to parcel
+    app.patch("/parcels/:id/assign-rider", async (req, res) => {
+      try {
+        const parcelId = req.params.id;
+        const { riderId, riderName, riderEmail } = req.body;
+
+        // update parcel
+        const parcelUpdate = await parcelCollection.updateOne(
+          { _id: new ObjectId(parcelId) },
+
+          {
+            $set: {
+              deliveryStatus: "rider-assigned",
+              assignedRiderId: riderId,
+              assignedRiderName: riderName,
+              assignedRiderEmail: riderEmail,
+              assigned_at: new Date().toISOString(),
+            },
+          },
+        );
+
+        // update rider
+        const riderUpdate = await ridersCollection.updateOne(
+          { _id: new ObjectId(riderId) },
+
+          {
+            $set: {
+              workStatus: "in-delivery",
+              updated_at: new Date().toISOString(),
+            },
+          },
+        );
+
+        res.json({
+          parcelModified: parcelUpdate.modifiedCount,
+          riderModified: riderUpdate.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Assign Rider Error:", error);
+
+        res.status(500).json({
+          message: "Failed to assign rider",
+        });
+      }
+    });
+
     app.delete("/riders/:id", async (req, res) => {
       const { id } = req.params;
 
       try {
-        // find rider first to get email
         const rider = await ridersCollection.findOne({
           _id: new ObjectId(id),
         });
@@ -433,57 +555,68 @@ const run = async () => {
           });
         }
 
-        // update user role to "user"
+        // fallback to "user" if previousRole not found
+        const roleToRestore = rider.previousRole || "user";
+
+        // restore previous role
         const userResult = await usersCollection.updateOne(
           { email: rider.email },
           {
             $set: {
-              role: "user",
+              role: roleToRestore,
               updated_at: new Date().toISOString(),
             },
           },
         );
 
-        // delete rider
+        // delete rider document
         const riderResult = await ridersCollection.deleteOne({
           _id: new ObjectId(id),
         });
 
         res.json({
           deletedCount: riderResult.deletedCount,
+          restoredRole: roleToRestore,
           userRoleUpdated: userResult.modifiedCount,
         });
       } catch (error) {
         console.error("Delete rider error:", error);
         res.status(500).json({
-          message: "Failed to delete rider and update user role",
+          message: "Failed to delete rider and restore previous role",
         });
       }
     });
+
     // -----------------------------
     // PARCEL MANAGEMENT ENDPOINTS
     // -----------------------------
 
     // GET: All Parcels
-    // GET /parcels/user?email=optional → get parcels by user email or all parcels, sorted latest first
-    app.get("/parcels", verifyFbToken, async (req, res) => {
+    app.get("/parcels",verifyFbToken,  async (req, res) => {
       try {
-        const userEmail = req.query.email;
+        const { email, paymentStatus, deliveryStatus } = req.query;
 
-        if (userEmail && req.decoded.email !== userEmail) {
+        if (email && req.decoded.email !== email) {
           return res.status(403).json({
             message: "Forbidden: You can only access your own parcels",
           });
         }
 
-        const parcelCollection = client.db("zapShift").collection("parcels");
+        let query = {};
 
-        // Build query
-        const query = userEmail ? { created_by: userEmail } : {};
+        if (email) {
+          query.created_by = email;
+        }
+        if (paymentStatus) {
+          query.paymentStatus = paymentStatus;
+        }
+        if (deliveryStatus) {
+          query.deliveryStatus = deliveryStatus;
+        }
 
         const parcels = await parcelCollection
           .find(query)
-          .sort({ creation_date: -1 }) // latest first
+          .sort({ creation_date: -1 })
           .toArray();
 
         res.json(parcels);
@@ -530,7 +663,7 @@ const run = async () => {
           return res.status(404).json({ message: "Parcel not found" });
 
         // Prevent deletion if paid
-        if (parcel.paymentStatus === "Paid")
+        if (parcel.paymentStatus === "paid")
           return res
             .status(403)
             .json({ message: "Paid parcels cannot be deleted" });
