@@ -110,6 +110,27 @@ const run = async () => {
       }
     };
 
+    const verifyRider = async (req, res, next) => {
+      try {
+        if (!req.decoded?.email) {
+          return res.status(401).json({ message: "Unauthorized access" });
+        }
+
+        const user = await usersCollection.findOne({
+          email: req.decoded.email,
+        });
+
+        if (!user || user.role !== "rider") {
+          return res.status(403).json({ message: "Forbidden access" });
+        }
+
+        next();
+      } catch (error) {
+        console.error("Rider verification error:", error);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    };
+
     // -----------------------------
     // USER MANAGEMENT ENDPOINTS
     // -----------------------------
@@ -367,6 +388,31 @@ const run = async () => {
       res.send(riders);
     });
 
+    // GET: Pending deliveries for rider
+    app.get("/rider/parcels", async (req, res) => {
+      try {
+        const riderEmail = req.query.email;
+
+        if (!riderEmail) {
+          return res.status(400).json({ message: "Rider email is required" });
+        }
+
+        const query = {
+          assignedRiderEmail: riderEmail,
+          deliveryStatus: { $in: ["rider-assigned", "in-transit"] },
+        };
+
+        const parcels = await parcelCollection
+          .find(query)
+          .sort({ creation_date: -1 }) // latest first
+          .toArray();
+
+        res.json(parcels);
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
     app.post("/riders", async (req, res) => {
       try {
         const rider = req.body;
@@ -592,7 +638,7 @@ const run = async () => {
     // -----------------------------
 
     // GET: All Parcels
-    app.get("/parcels",verifyFbToken,  async (req, res) => {
+    app.get("/parcels", verifyFbToken, async (req, res) => {
       try {
         const { email, paymentStatus, deliveryStatus } = req.query;
 
@@ -649,6 +695,68 @@ const run = async () => {
         });
       } catch (error) {
         res.status(500).json({ error: error.message });
+      }
+    });
+
+    // update parcel delivery status and rider work status
+    app.patch("/parcels/:id/status", verifyFbToken, verifyRider, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { deliveryStatus } = req.body;
+
+        // find parcel first
+        const parcel = await parcelCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!parcel) {
+          return res.status(404).json({
+            message: "Parcel not found",
+          });
+        }
+
+        // update parcel
+        const parcelResult = await parcelCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              deliveryStatus,
+              updated_at: new Date().toISOString(),
+            },
+          },
+        );
+
+        let riderResult = null;
+
+        // determine rider work status
+        if (parcel.assignedRiderId) {
+          let riderWorkStatus = "in-delivery";
+
+          if (deliveryStatus === "delivered") {
+            riderWorkStatus = "free";
+          }
+
+          riderResult = await ridersCollection.updateOne(
+            { _id: new ObjectId(parcel.assignedRiderId) },
+            {
+              $set: {
+                workStatus: riderWorkStatus,
+                updated_at: new Date().toISOString(),
+              },
+            },
+          );
+        }
+
+        res.json({
+          parcelModified: parcelResult.modifiedCount,
+          riderModified: riderResult?.modifiedCount || 0,
+        });
+      } catch (error) {
+        console.error("Update Parcel Status Error:", error);
+
+        res.status(500).json({
+          message: "Failed to update parcel status",
+        });
       }
     });
 
